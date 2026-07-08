@@ -1,335 +1,362 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const crypto = require('crypto');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Middleware - IMPORTANT: l'ordre compte!
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.json({ limit: '10mb' }));
 
-// Logging middleware pour debug
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-  next();
-});
-
-// NVIDIA NIM API configuration
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
+const NIM_BASE_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
-const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
+const DRAFT_MODEL = process.env.DRAFT_MODEL || 'z-ai/glm-5.2';
+const POLISH_MODEL = process.env.POLISH_MODEL || 'z-ai/glm-5.2';
+const SUMMARY_MODEL = process.env.SUMMARY_MODEL || DRAFT_MODEL;
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwargs thinking parameter
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
-// Model mapping (adjust based on available NIM models)
-const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'gpt-4': 'deepseek-ai/deepseek-v3.1-terminus',
-  'gpt-4-turbo': 'deepseek-ai/deepseek-v3.2',
-  'gpt-4o': 'deepseek-ai/deepseek-v3.1',
-  'claude-3-opus': 'openai/gpt-oss-120b',
-  'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'moonshotai/kimi-k2.5'
-};
+// ---------- Chat ID marker (zero-width encoding) ----------
+// Invisible marker embedded in the assistant's FIRST reply of a chat so we can
+// recognize and reuse the same chat ID on every subsequent turn, without
+// JanitorAI ever needing to give us an explicit conversation ID.
+const DELIM = '\u200D';
+const BIT0 = '\u200B';
+const BIT1 = '\u200C';
 
-// Root endpoint
-app.get('/', (req, res) => {
-  res.json({
-    service: 'OpenAI to NVIDIA NIM Proxy',
-    version: '1.0.0',
-    endpoints: {
-      health: '/health',
-      models: '/v1/models',
-      chat: '/v1/chat/completions'
+function generateChatId() {
+  return crypto.randomBytes(8).toString('hex');
+}
+
+function encodeMarker(id) {
+  const bits = id
+    .split('')
+    .map(ch => parseInt(ch, 16).toString(2).padStart(4, '0'))
+    .join('');
+  const encoded = bits.split('').map(b => (b === '0' ? BIT0 : BIT1)).join('');
+  return `${DELIM}${encoded}${DELIM}`;
+}
+
+function decodeMarker(text) {
+  const match = text.match(new RegExp(`${DELIM}([${BIT0}${BIT1}]+)${DELIM}`));
+  if (!match) return null;
+  const bits = match[1].split('').map(ch => (ch === BIT0 ? '0' : '1')).join('');
+  let id = '';
+  for (let i = 0; i < bits.length; i += 4) {
+    id += parseInt(bits.slice(i, i + 4), 2).toString(16);
+  }
+  return id;
+}
+
+function stripMarker(text) {
+  return text.replace(new RegExp(`${DELIM}[${BIT0}${BIT1}]+${DELIM}`), '');
+}
+
+// Finds the most recent assistant message in the incoming (confirmed) history,
+// along with its index in the array. Only messages that survive here are ones
+// JanitorAI actually kept and replayed back to us — a rerolled/rejected reply
+// never shows up in a future request, so it never reaches this function.
+function getLastAssistantEntry(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant' && typeof messages[i].content === 'string') {
+      return { index: i, content: stripMarker(messages[i].content) };
     }
-  });
-});
+  }
+  return null;
+}
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
-    reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE,
-    nim_api_configured: !!NIM_API_KEY
-  });
-});
+function findExistingChatId(messages) {
+  for (const m of messages) {
+    if (m.role === 'assistant' && typeof m.content === 'string') {
+      const id = decodeMarker(m.content);
+      if (id) return id;
+    }
+  }
+  return null;
+}
 
-// List models endpoint (OpenAI compatible)
-app.get('/v1/models', (req, res) => {
-  const models = Object.keys(MODEL_MAPPING).map(model => ({
-    id: model,
-    object: 'model',
-    created: Date.now(),
-    owned_by: 'nvidia-nim-proxy'
-  }));
-  
-  res.json({
-    object: 'list',
-    data: models
-  });
-});
+// ---------- Character ID ----------
+// Hash of the character's system/persona prompt, so the same character always
+// maps to the same key even without JanitorAI giving us an explicit ID.
+function getCharacterId(messages) {
+  const systemMsg = messages.find(m => m.role === 'system');
+  const basis = systemMsg?.content || messages[0]?.content || '';
+  return crypto.createHash('sha256').update(basis).digest('hex').slice(0, 16);
+}
 
-// Chat completions endpoint (main proxy)
-app.post('/v1/chat/completions', async (req, res) => {
-  console.log('Received chat completion request');
-  console.log('Body:', JSON.stringify(req.body, null, 2));
-  
+// ---------- Notebook load/save ----------
+async function loadNotebook(key) {
   try {
-    // Validate API key
-    if (!NIM_API_KEY) {
-      console.error('NIM_API_KEY not configured');
-      return res.status(500).json({
-        error: {
-          message: 'NVIDIA API key not configured',
-          type: 'invalid_request_error',
-          code: 500
-        }
-      });
-    }
-
-    const { model, messages, temperature, max_tokens, stream } = req.body;
-    
-    // Validate required fields
-    if (!model || !messages) {
-      return res.status(400).json({
-        error: {
-          message: 'Missing required fields: model and messages are required',
-          type: 'invalid_request_error',
-          code: 400
-        }
-      });
-    }
-    
-    // Smart model selection with fallback
-    let nimModel = MODEL_MAPPING[model];
-    console.log(`Model mapping: ${model} -> ${nimModel || 'trying fallback'}`);
-    
-    if (!nimModel) {
-      try {
-        const testResponse = await axios.post(`${NIM_API_BASE}/chat/completions`, {
-          model: model,
-          messages: [{ role: 'user', content: 'test' }],
-          max_tokens: 1
-        }, {
-          headers: { 
-            'Authorization': `Bearer ${NIM_API_KEY}`, 
-            'Content-Type': 'application/json' 
-          },
-          validateStatus: (status) => status < 500
-        });
-        
-        if (testResponse.status >= 200 && testResponse.status < 300) {
-          nimModel = model;
-          console.log(`Model ${model} is directly supported by NIM`);
-        }
-      } catch (e) {
-        console.log('Model test failed, using fallback logic');
-      }
-      
-      if (!nimModel) {
-        const modelLower = model.toLowerCase();
-        if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
-          nimModel = 'meta/llama-3.1-405b-instruct';
-        } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
-          nimModel = 'meta/llama-3.1-70b-instruct';
-        } else {
-          nimModel = 'meta/llama-3.1-8b-instruct';
-        }
-        console.log(`Using fallback model: ${nimModel}`);
-      }
-    }
-    
-    // Transform OpenAI request to NIM format
-    const nimRequest = {
-      model: nimModel,
-      messages: messages,
-      temperature: temperature !== undefined ? temperature : 0.6,
-      max_tokens: max_tokens || 9024,
-      stream: stream || false
+    const raw = await redis.get(key);
+    if (!raw) return { summary: '', recent: [], lastRecordedIndex: -1 };
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return {
+      summary: parsed.summary || '',
+      recent: parsed.recent || [],
+      lastRecordedIndex: typeof parsed.lastRecordedIndex === 'number' ? parsed.lastRecordedIndex : -1,
     };
+  } catch (err) {
+    console.error('Redis load error:', err.message);
+    return { summary: '', recent: [], lastRecordedIndex: -1 };
+  }
+}
 
-    if (ENABLE_THINKING_MODE) {
-      nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
-    }
-    
-    console.log('Sending request to NVIDIA NIM:', JSON.stringify(nimRequest, null, 2));
-    
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+async function saveNotebook(key, notebook) {
+  try {
+    await redis.set(key, JSON.stringify(notebook));
+  } catch (err) {
+    console.error('Redis save error:', err.message);
+  }
+}
+
+// ---------- Notebook summarization ----------
+const SUMMARY_TRIGGER_COUNT = 6; // condense every N accumulated exchanges
+
+const SUMMARIZE_INSTRUCTION =
+  "You maintain a running memory summary for an ongoing roleplay chat. " +
+  "You will be given the CURRENT summary (may be empty) and a list of RECENT " +
+  "exchanges since the last update. Merge them into a single updated summary.\n\n" +
+  "Rules:\n" +
+  "- Keep only what matters for future continuity: established facts, " +
+  "relationships, ongoing plot threads, settings, promises made, unresolved " +
+  "tension, character states/injuries/emotions.\n" +
+  "- Drop moment-to-moment dialogue and flourish — keep the substance, not the prose.\n" +
+  "- Write in concise third-person notes, not narrative prose. Bullet-style " +
+  "fragments are fine.\n" +
+  "- Target length: 4-8 short sentences/fragments MAX, regardless of how much " +
+  "input you're given. If old and new info conflict, prefer the newer info.\n" +
+  "- Do not invent anything not present in the input.\n\n" +
+  "Return only the updated summary text, no preamble.";
+
+async function summarizeNotebook(notebook) {
+  const recentText = notebook.recent
+    .map(r => `Turn ${r.turn}: ${r.snippet}`)
+    .join('\n');
+
+  const prompt =
+    `${SUMMARIZE_INSTRUCTION}\n\n` +
+    `CURRENT SUMMARY:\n${notebook.summary || '(empty, this is the first summarization)'}\n\n` +
+    `RECENT EXCHANGES:\n${recentText}`;
+
+  try {
+    const updated = await callNim(SUMMARY_MODEL, [{ role: 'user', content: prompt }], 300);
+    return updated.trim();
+  } catch (err) {
+    console.error('Summarization error:', err.message);
+    // On failure, keep the old summary rather than losing it.
+    return notebook.summary;
+  }
+}
+
+// ---------- NIM API call ----------
+async function callNim(model, messages, max_tokens = 1024) {
+  const response = await axios.post(
+    NIM_BASE_URL,
+    { model, messages, max_tokens },
+    {
       headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
+        Authorization: `Bearer ${NIM_API_KEY}`,
+        'Content-Type': 'application/json',
       },
-      responseType: stream ? 'stream' : 'json',
-      validateStatus: () => true
-    });
-    
-    // Check for errors
-    if (response.status >= 400) {
-      console.error('NVIDIA API error:', response.status, response.data);
-      return res.status(response.status).json({
-        error: {
-          message: response.data?.error?.message || 'NVIDIA API request failed',
-          type: 'invalid_request_error',
-          code: response.status
-        }
-      });
+      timeout: 120000,
     }
-    
+  );
+  return response.data.choices[0].message.content;
+}
+
+// Strict in-character enforcement pass. Unlike a copyedit pass, this one is
+// specifically hunting for character breaks and correcting them — but it's
+// still bounded: it corrects breaks, it doesn't rewrite the scene.
+const POLISH_INSTRUCTION =
+  "You are a strict in-character consistency reviewer for a roleplay draft " +
+  "written by another model. Your job is to catch and fix any place where the " +
+  "draft broke character, then hand back a corrected version — not to rewrite " +
+  "the scene.\n\n" +
+  "Check the draft against the character's established personality, voice, " +
+  "speech patterns, knowledge, and the conversation history, and fix any of " +
+  "the following if present:\n" +
+  "1. POV violations: the draft has the USER's character speak, act, or " +
+  "decide something on its own that wasn't given to it in the conversation " +
+  "history. Correct this so that character only reacts to what it was given — " +
+  "never invents its own initiative. This is the most common and most serious " +
+  "mistake to catch.\n" +
+  "2. Tone/personality breaks: the roleplay character suddenly acting far " +
+  "outside its established personality, speech style, or knowledge with no " +
+  "narrative reason (e.g. a cold character being suddenly warm, a character " +
+  "knowing something it has no way of knowing, dropping an established accent " +
+  "or verbal tic, contradicting a previously stated fact about itself).\n" +
+  "3. Meta breaks: the draft slipping out of the fiction — narrator asides, " +
+  "AI-assistant-style disclaimers, apologizing out of character, safety " +
+  "boilerplate, or any acknowledgment that this is an AI/roleplay/story. " +
+  "Remove these entirely and replace with an in-fiction equivalent if needed.\n" +
+  "4. Continuity errors: contradicting an established fact from the " +
+  "conversation history (a prop, a name, an injury, a location, a promise " +
+  "made earlier).\n\n" +
+  "If NONE of the above are present, make no changes beyond trivial word " +
+  "choice/flow polish — do not rewrite dialogue or actions that are already " +
+  "in-character and consistent, and do not add new plot events, props, or " +
+  "decisions that the draft didn't already contain.\n\n" +
+  "Use the full conversation history below only as your source of truth for " +
+  "what's already been established — do not respond to it or continue the " +
+  "conversation yourself.\n\n" +
+  "Hard constraint: your output must be roughly the same length as the draft " +
+  "(within about 20%) — you are correcting specific breaks, not padding or " +
+  "expanding the scene. Return only the corrected response, no preamble, no " +
+  "explanation of what you changed, no meta-commentary about the review itself.";
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    draft_model: DRAFT_MODEL,
+    polish_model: POLISH_MODEL,
+    summary_model: SUMMARY_MODEL,
+    key_configured: Boolean(NIM_API_KEY),
+    redis_configured: Boolean(process.env.UPSTASH_REDIS_REST_URL),
+  });
+});
+
+app.post('/v1/chat/completions', async (req, res) => {
+  try {
+    const { messages, stream } = req.body;
+
+    if (!NIM_API_KEY) {
+      return res.status(500).json({ error: { message: 'NIM_API_KEY not configured on server' } });
+    }
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: { message: 'messages array is required' } });
+    }
+
+    // --- Identify character + chat, load notebook ---
+    const characterId = getCharacterId(messages);
+    let chatId = findExistingChatId(messages);
+    const isNewChat = !chatId;
+    if (isNewChat) chatId = generateChatId();
+
+    const notebookKey = `notebook:${characterId}:${chatId}`;
+    const notebook = await loadNotebook(notebookKey);
+
+    // --- Record any newly-CONFIRMED assistant message from incoming history ---
+    // This runs on the incoming `messages` array (what JanitorAI has already
+    // accepted and is replaying back to us), NOT on anything we're about to
+    // generate. A rerolled/rejected reply never reappears in a future request,
+    // so it never gets recorded here — only what the user actually kept does.
+    const lastAssistant = getLastAssistantEntry(messages);
+    if (lastAssistant && lastAssistant.index > notebook.lastRecordedIndex) {
+      notebook.recent.push({ turn: lastAssistant.index, snippet: lastAssistant.content.slice(0, 300) });
+      notebook.lastRecordedIndex = lastAssistant.index;
+
+      if (notebook.recent.length >= SUMMARY_TRIGGER_COUNT) {
+        notebook.summary = await summarizeNotebook(notebook);
+        notebook.recent = [];
+      }
+
+      await saveNotebook(notebookKey, notebook);
+    }
+
+    // --- Inject persistent memory into the draft prompt ---
+    const notebookContext = notebook.summary
+      ? `\n\n[Persistent memory for this chat: ${notebook.summary}]`
+      : '';
+    const messagesWithMemory = notebookContext
+      ? [
+          ...messages.slice(0, 1), // keep original system/first message first if present
+          { role: 'system', content: notebookContext },
+          ...messages.slice(1),
+        ]
+      : messages;
+
+    // Step 1: draft model stays in character using the full conversation history
+    const draft = await callNim(DRAFT_MODEL, messagesWithMemory);
+
+    // Step 2: polish model does a light copyedit pass, grounded on the full
+    // conversation history, length-capped relative to the draft.
+    const polishMessages = [
+      {
+        role: 'user',
+        content:
+          `${POLISH_INSTRUCTION}\n\n` +
+          `Full conversation history (for grounding/consistency only — do not respond to it):\n` +
+          `${JSON.stringify(messages)}\n\n` +
+          `Draft to copyedit:\n${draft}`,
+      },
+    ];
+
+    const estimatedDraftTokens = Math.ceil(draft.length / 4);
+    const polishMaxTokens = Math.max(256, Math.ceil(estimatedDraftTokens * 1.3));
+
+    let finalText = await callNim(POLISH_MODEL, polishMessages, polishMaxTokens);
+
+    // Safety net: if the polish pass still bloats the response well past the
+    // draft, prefer the draft over a padded rewrite.
+    if (finalText.length > draft.length * 1.6) {
+      console.warn('Polish output exceeded length guard, falling back to draft.');
+      finalText = draft;
+    }
+
+    // Note: we do NOT record `finalText` here. It only gets written to the
+    // notebook once it comes back to us as confirmed history on a future
+    // request (handled by the block above, near the top of this handler).
+    // This is what makes rerolled/rejected replies invisible to memory.
+
+    // --- Embed chat ID marker on EVERY reply, not just the first ---
+    // This is deliberate: if old messages ever fall out of what JanitorAI
+    // sends us (context truncation, forking into a new chat, etc.), we only
+    // need ONE surviving assistant message with the marker to correctly
+    // recognize and continue the same memory. Embedding it every time is
+    // cheap (same ID, tiny overhead) and makes the whole system resilient
+    // to history being cut or duplicated.
+    finalText += encodeMarker(chatId);
+
+    // --- Respond ---
     if (stream) {
-      // Handle streaming response with reasoning
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      
-      let buffer = '';
-      let reasoningStarted = false;
-      
-      response.data.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        
-        lines.forEach(line => {
-          if (line.startsWith('data: ')) {
-            if (line.includes('[DONE]')) {
-              res.write(line + '\n\n');
-              return;
-            }
-            
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.choices?.[0]?.delta) {
-                const reasoning = data.choices[0].delta.reasoning_content;
-                const content = data.choices[0].delta.content;
-                
-                if (SHOW_REASONING) {
-                  let combinedContent = '';
-                  
-                  if (reasoning && !reasoningStarted) {
-                    combinedContent = '<think>\n' + reasoning;
-                    reasoningStarted = true;
-                  } else if (reasoning) {
-                    combinedContent = reasoning;
-                  }
-                  
-                  if (content && reasoningStarted) {
-                    combinedContent += '</think>\n\n' + content;
-                    reasoningStarted = false;
-                  } else if (content) {
-                    combinedContent += content;
-                  }
-                  
-                  if (combinedContent) {
-                    data.choices[0].delta.content = combinedContent;
-                    delete data.choices[0].delta.reasoning_content;
-                  }
-                } else {
-                  data.choices[0].delta.content = content || '';
-                  delete data.choices[0].delta.reasoning_content;
-                }
-              }
-              res.write(`data: ${JSON.stringify(data)}\n\n`);
-            } catch (e) {
-              console.error('Error parsing stream chunk:', e);
-              res.write(line + '\n\n');
-            }
-          }
-        });
-      });
-      
-      response.data.on('end', () => {
-        console.log('Stream ended');
-        res.end();
-      });
-      
-      response.data.on('error', (err) => {
-        console.error('Stream error:', err);
-        res.end();
-      });
-    } else {
-      // Transform NIM response to OpenAI format with reasoning
-      console.log('Received response from NVIDIA NIM');
-      
-      const openaiResponse = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: response.data.choices.map(choice => {
-          let fullContent = choice.message?.content || '';
-          
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
-          }
-          
-          return {
-            index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
-            finish_reason: choice.finish_reason
-          };
-        }),
-        usage: response.data.usage || {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
+
+      const chunk = {
+        id: 'chatcmpl-proxy',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: { role: 'assistant', content: finalText }, finish_reason: null }],
       };
-      
-      console.log('Sending response to client');
-      res.json(openaiResponse);
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+
+      const doneChunk = {
+        id: 'chatcmpl-proxy',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      };
+      res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      res.json({
+        id: 'chatcmpl-proxy',
+        object: 'chat.completion',
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: finalText },
+            finish_reason: 'stop',
+          },
+        ],
+      });
     }
-    
-  } catch (error) {
-    console.error('Proxy error:', error.message);
-    console.error('Error details:', error.response?.data || error);
-    
-    res.status(error.response?.status || 500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500,
-        details: error.response?.data
-      }
+  } catch (err) {
+    console.error('Proxy error:', err.response?.data || err.message);
+    res.status(500).json({
+      error: { message: err.response?.data?.error?.message || err.message || 'Proxy request failed' },
     });
   }
 });
 
-// Catch-all for unsupported endpoints - MUST BE LAST
-app.all('*', (req, res) => {
-  console.log(`404: ${req.method} ${req.path} not found`);
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.method} ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Proxy running on port ${PORT}`);
+  console.log(`Draft model: ${DRAFT_MODEL}`);
+  console.log(`Polish model: ${POLISH_MODEL}`);
+  console.log(`Summary model: ${SUMMARY_MODEL}`);
 });
-
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`========================================`);
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Models: http://localhost:${PORT}/v1/models`);
-  console.log(`Chat: POST http://localhost:${PORT}/v1/chat/completions`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`NIM API Key configured: ${NIM_API_KEY ? 'YES' : 'NO'}`);
-  console.log(`========================================`);
-});
-
-// Export for Vercel
-module.exports = app;
