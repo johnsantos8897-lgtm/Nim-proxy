@@ -153,10 +153,15 @@ async function summarizeNotebook(notebook) {
 }
 
 // ---------- NIM API call ----------
-async function callNim(model, messages, max_tokens = 1024) {
+async function callNim(model, messages, max_tokens = 1024, enableThinking = false) {
+  const body = { model, messages, max_tokens };
+  if (enableThinking) {
+    body.chat_template_kwargs = { enable_thinking: true };
+    body.reasoning_effort = 'high';
+  }
   const response = await axios.post(
     NIM_BASE_URL,
-    { model, messages, max_tokens },
+    body,
     {
       headers: {
         Authorization: `Bearer ${NIM_API_KEY}`,
@@ -165,6 +170,8 @@ async function callNim(model, messages, max_tokens = 1024) {
       timeout: 120000,
     }
   );
+  // Only the final answer is returned — reasoning_content (if present) is
+  // internal scratch work and is never surfaced to the user.
   return response.data.choices[0].message.content;
 }
 
@@ -286,9 +293,12 @@ app.post('/v1/chat/completions', async (req, res) => {
     ];
 
     const estimatedDraftTokens = Math.ceil(draft.length / 4);
-    const polishMaxTokens = Math.max(256, Math.ceil(estimatedDraftTokens * 1.3));
+    // Extra headroom beyond the normal length guard, since reasoning tokens
+    // (the model's internal "thinking") count against max_tokens too, even
+    // though only the final content is ever returned to the user.
+    const polishMaxTokens = Math.max(256, Math.ceil(estimatedDraftTokens * 1.3)) + 1024;
 
-    let finalText = await callNim(POLISH_MODEL, polishMessages, polishMaxTokens);
+    let finalText = await callNim(POLISH_MODEL, polishMessages, polishMaxTokens, true);
 
     // Safety net: if the polish pass still bloats the response well past the
     // draft, prefer the draft over a padded rewrite.
