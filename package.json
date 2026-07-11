@@ -9,7 +9,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "@upstash/redis": "^1.34.0"
   },
   "engines": {
     "node": "22.x"
