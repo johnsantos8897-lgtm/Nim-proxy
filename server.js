@@ -89,19 +89,22 @@ function getCharacterId(messages) {
 }
 
 // ---------- Notebook load/save ----------
+// notebook.tiers is an array of arrays of strings. tiers[0] holds individual
+// per-message compressed notes waiting to be grouped; tiers[1], tiers[2], ...
+// hold progressively more condensed, progressively older memory. Higher tier
+// = older + more compressed. Lower tier = more recent + more detailed.
 async function loadNotebook(key) {
   try {
     const raw = await redis.get(key);
-    if (!raw) return { summary: '', recent: [], lastRecordedIndex: -1 };
+    if (!raw) return { tiers: [[]], lastRecordedIndex: -1 };
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
     return {
-      summary: parsed.summary || '',
-      recent: parsed.recent || [],
+      tiers: Array.isArray(parsed.tiers) && parsed.tiers.length ? parsed.tiers : [[]],
       lastRecordedIndex: typeof parsed.lastRecordedIndex === 'number' ? parsed.lastRecordedIndex : -1,
     };
   } catch (err) {
     console.error('Redis load error:', err.message);
-    return { summary: '', recent: [], lastRecordedIndex: -1 };
+    return { tiers: [[]], lastRecordedIndex: -1 };
   }
 }
 
@@ -113,43 +116,98 @@ async function saveNotebook(key, notebook) {
   }
 }
 
-// ---------- Notebook summarization ----------
-const SUMMARY_TRIGGER_COUNT = 6; // condense every N accumulated exchanges
+// ---------- Tiered memory compression ----------
+// Tier 0 groups by 5 (individual message notes -> first condensed note).
+// Every tier above that groups by 3 (condensed notes -> more condensed notes),
+// cascading upward with no fixed ceiling.
+const TIER_BASE_GROUP_SIZE = 5;
+const TIER_UPPER_GROUP_SIZE = 3;
+function groupSizeForTier(tierIndex) {
+  return tierIndex === 0 ? TIER_BASE_GROUP_SIZE : TIER_UPPER_GROUP_SIZE;
+}
 
-const SUMMARIZE_INSTRUCTION =
-  "You maintain a running memory summary for an ongoing roleplay chat. " +
-  "You will be given the CURRENT summary (may be empty) and a list of RECENT " +
-  "exchanges since the last update. Merge them into a single updated summary.\n\n" +
-  "Rules:\n" +
-  "- Keep only what matters for future continuity: established facts, " +
-  "relationships, ongoing plot threads, settings, promises made, unresolved " +
-  "tension, character states/injuries/emotions.\n" +
-  "- Drop moment-to-moment dialogue and flourish — keep the substance, not the prose.\n" +
-  "- Write in concise third-person notes, not narrative prose. Bullet-style " +
-  "fragments are fine.\n" +
-  "- Target length: 4-8 short sentences/fragments MAX, regardless of how much " +
-  "input you're given. If old and new info conflict, prefer the newer info.\n" +
-  "- Do not invent anything not present in the input.\n\n" +
-  "Return only the updated summary text, no preamble.";
+const MICRO_SUMMARY_INSTRUCTION =
+  "You are compressing a single roleplay message into a compact note for " +
+  "long-term memory. Preserve EVERY concrete detail: actions taken, decisions " +
+  "made, facts revealed, objects/props introduced, physical or emotional " +
+  "states, injuries, promises, and the substance of dialogue (paraphrased, " +
+  "not verbatim). You may cut purely stylistic flourish, scene-setting " +
+  "description, and repeated wording that carries no new information — but " +
+  "do not omit any plot-relevant detail. Write concise third-person notes, " +
+  "not narrative prose.\n\n" +
+  "HARD LENGTH BUDGET: your entire output must fit within roughly 500 tokens " +
+  "(about 350-375 words), no matter how long the input is. This is not " +
+  "optional — if the input is long or detail-dense, compress MORE AGGRESSIVELY " +
+  "so the finished note still fits the budget in full, rather than running out " +
+  "of room partway through. Never let your output get cut off mid-thought — " +
+  "always finish within the budget, prioritizing the most plot-relevant " +
+  "details if you must choose what to keep.\n\n" +
+  "Return only the compressed note, no preamble.";
 
-async function summarizeNotebook(notebook) {
-  const recentText = notebook.recent
-    .map(r => `Turn ${r.turn}: ${r.snippet}`)
-    .join('\n');
+const MERGE_SUMMARY_INSTRUCTION =
+  "You are merging several already-compressed memory notes (given in " +
+  "chronological order) into one combined note for long-term memory. Remove " +
+  "redundancy across them, but keep every distinct concrete detail: facts, " +
+  "decisions, relationships, ongoing threads, states, promises. If entries " +
+  "conflict, prefer the later one. Write concise third-person notes, not " +
+  "narrative prose.\n\n" +
+  "HARD LENGTH BUDGET: your entire output must fit within roughly 500 tokens " +
+  "(about 350-375 words), no matter how many notes you're merging or how much " +
+  "detail they contain. This is not optional — if there's a lot to merge, " +
+  "compress MORE AGGRESSIVELY so the finished note still fits the budget in " +
+  "full, rather than running out of room partway through. Never let your " +
+  "output get cut off mid-thought — always finish within the budget, " +
+  "prioritizing the most plot-relevant and most recent details if you must " +
+  "choose what to keep.\n\n" +
+  "Return only the merged note, no preamble.";
 
-  const prompt =
-    `${SUMMARIZE_INSTRUCTION}\n\n` +
-    `CURRENT SUMMARY:\n${notebook.summary || '(empty, this is the first summarization)'}\n\n` +
-    `RECENT EXCHANGES:\n${recentText}`;
-
+async function condenseTexts(instruction, texts) {
+  const joined = texts.map((t, i) => `[${i + 1}] ${t}`).join('\n\n');
+  const prompt = `${instruction}\n\nINPUT:\n${joined}`;
   try {
-    const updated = await callNim(SUMMARY_MODEL, [{ role: 'user', content: prompt }], 300);
-    return updated.trim();
+    // max_tokens is set a bit above the instructed 500-token target, purely
+    // as a safety ceiling — the model is told to self-compress and land
+    // under ~500 on its own. This headroom just avoids a hard API-level cut
+    // in the rare case it runs slightly over while still finishing its
+    // thought.
+    const result = await callNim(SUMMARY_MODEL, [{ role: 'user', content: prompt }], 650);
+    return result.trim();
   } catch (err) {
-    console.error('Summarization error:', err.message);
-    // On failure, keep the old summary rather than losing it.
-    return notebook.summary;
+    console.error('Condense error:', err.message);
+    // On failure, fall back to a raw truncated join rather than losing the
+    // content entirely.
+    return texts.join(' ').slice(0, 800);
   }
+}
+
+// Records one newly-confirmed message into tier 0, then cascades merges
+// upward through as many tiers as have hit their group-size threshold.
+async function recordIntoTiers(notebook, content) {
+  const microNote = await condenseTexts(MICRO_SUMMARY_INSTRUCTION, [content]);
+  notebook.tiers[0] = notebook.tiers[0] || [];
+  notebook.tiers[0].push(microNote);
+
+  let tier = 0;
+  while (notebook.tiers[tier] && notebook.tiers[tier].length >= groupSizeForTier(tier)) {
+    const size = groupSizeForTier(tier);
+    const group = notebook.tiers[tier].splice(0, size); // take the oldest N, remove them
+    const merged = await condenseTexts(MERGE_SUMMARY_INSTRUCTION, group);
+    notebook.tiers[tier + 1] = notebook.tiers[tier + 1] || [];
+    notebook.tiers[tier + 1].push(merged);
+    tier++; // check whether the tier above now also hit its threshold
+  }
+}
+
+// Builds the memory text injected into the draft prompt: oldest/broadest
+// (highest tier) first, down to most recent/most detailed (tier 0) last.
+function buildMemoryContext(notebook) {
+  const parts = [];
+  for (let i = notebook.tiers.length - 1; i >= 0; i--) {
+    if (notebook.tiers[i] && notebook.tiers[i].length > 0) {
+      parts.push(notebook.tiers[i].join(' '));
+    }
+  }
+  return parts.join('\n');
 }
 
 // ---------- NIM API call ----------
@@ -251,22 +309,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     // accepted and is replaying back to us), NOT on anything we're about to
     // generate. A rerolled/rejected reply never reappears in a future request,
     // so it never gets recorded here — only what the user actually kept does.
+    // Recording now cascades through the tiered compression system: each
+    // confirmed message becomes its own compressed note, and groups of notes
+    // periodically get condensed further up the tier chain.
     const lastAssistant = getLastAssistantEntry(messages);
     if (lastAssistant && lastAssistant.index > notebook.lastRecordedIndex) {
-      notebook.recent.push({ turn: lastAssistant.index, snippet: lastAssistant.content.slice(0, 300) });
+      await recordIntoTiers(notebook, lastAssistant.content);
       notebook.lastRecordedIndex = lastAssistant.index;
-
-      if (notebook.recent.length >= SUMMARY_TRIGGER_COUNT) {
-        notebook.summary = await summarizeNotebook(notebook);
-        notebook.recent = [];
-      }
-
       await saveNotebook(notebookKey, notebook);
     }
 
     // --- Inject persistent memory into the draft prompt ---
-    const notebookContext = notebook.summary
-      ? `\n\n[Persistent memory for this chat: ${notebook.summary}]`
+    const memoryText = buildMemoryContext(notebook);
+    const notebookContext = memoryText
+      ? `\n\n[Persistent memory for this chat, oldest/broadest first, most recent/detailed last: ${memoryText}]`
       : '';
     const messagesWithMemory = notebookContext
       ? [
