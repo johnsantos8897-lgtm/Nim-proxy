@@ -14,6 +14,10 @@ const NIM_BASE_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 const DRAFT_MODEL = process.env.DRAFT_MODEL || 'z-ai/glm-5.2';
 const POLISH_MODEL = process.env.POLISH_MODEL || 'z-ai/glm-5.2';
 const SUMMARY_MODEL = process.env.SUMMARY_MODEL || DRAFT_MODEL;
+// 'high' is noticeably slower for a marginal quality gain in most cases.
+// 'medium' is a better default for chat latency; override via env if you
+// want to trade speed for more thorough in-character review.
+const REASONING_EFFORT = process.env.REASONING_EFFORT || 'medium';
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -215,7 +219,7 @@ async function callNim(model, messages, max_tokens = 1024, enableThinking = fals
   const body = { model, messages, max_tokens };
   if (enableThinking) {
     body.chat_template_kwargs = { enable_thinking: true };
-    body.reasoning_effort = 'high';
+    body.reasoning_effort = REASONING_EFFORT;
   }
   const response = await axios.post(
     NIM_BASE_URL,
@@ -304,22 +308,12 @@ app.post('/v1/chat/completions', async (req, res) => {
     const notebookKey = `notebook:${characterId}:${chatId}`;
     const notebook = await loadNotebook(notebookKey);
 
-    // --- Record any newly-CONFIRMED assistant message from incoming history ---
-    // This runs on the incoming `messages` array (what JanitorAI has already
-    // accepted and is replaying back to us), NOT on anything we're about to
-    // generate. A rerolled/rejected reply never reappears in a future request,
-    // so it never gets recorded here — only what the user actually kept does.
-    // Recording now cascades through the tiered compression system: each
-    // confirmed message becomes its own compressed note, and groups of notes
-    // periodically get condensed further up the tier chain.
-    const lastAssistant = getLastAssistantEntry(messages);
-    if (lastAssistant && lastAssistant.index > notebook.lastRecordedIndex) {
-      await recordIntoTiers(notebook, lastAssistant.content);
-      notebook.lastRecordedIndex = lastAssistant.index;
-      await saveNotebook(notebookKey, notebook);
-    }
-
-    // --- Inject persistent memory into the draft prompt ---
+    // --- Inject persistent memory (as of before this turn) into the draft prompt ---
+    // We build context from the notebook as it currently stands, BEFORE
+    // recording this turn's newly-confirmed message. That's fine: the raw
+    // message is already present in `messages` sent to the draft model
+    // directly, so nothing is lost — it just hasn't been folded into the
+    // compressed long-term notes yet, which happens in the background below.
     const memoryText = buildMemoryContext(notebook);
     const notebookContext = memoryText
       ? `\n\n[Persistent memory for this chat, oldest/broadest first, most recent/detailed last: ${memoryText}]`
@@ -331,6 +325,25 @@ app.post('/v1/chat/completions', async (req, res) => {
           ...messages.slice(1),
         ]
       : messages;
+
+    // --- Record any newly-CONFIRMED assistant message, in the BACKGROUND ---
+    // This runs on the incoming `messages` array (what JanitorAI has already
+    // accepted and is replaying back to us), NOT on anything we're about to
+    // generate. A rerolled/rejected reply never reappears in a future request,
+    // so it never gets recorded — only what the user actually kept does.
+    // Deliberately NOT awaited: this involves extra model calls (micro-
+    // summary + possible tier cascades) that would otherwise add real
+    // latency to every single reply, for no benefit to THIS turn's response
+    // (the raw message is already in `messages` above, so the draft model
+    // sees it regardless). It just saves to Redis whenever it finishes.
+    const lastAssistant = getLastAssistantEntry(messages);
+    if (lastAssistant && lastAssistant.index > notebook.lastRecordedIndex) {
+      const indexToRecord = lastAssistant.index;
+      notebook.lastRecordedIndex = indexToRecord; // mark immediately so a concurrent request can't double-record
+      recordIntoTiers(notebook, lastAssistant.content)
+        .then(() => saveNotebook(notebookKey, notebook))
+        .catch(err => console.error('Background memory recording failed:', err.message));
+    }
 
     // Step 1: draft model stays in character using the full conversation history
     const draft = await callNim(DRAFT_MODEL, messagesWithMemory);
