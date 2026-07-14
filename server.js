@@ -218,9 +218,24 @@ async function callNim(model, messages, max_tokens = 1024, enableThinking = fals
       timeout: 120000,
     }
   );
+  const message = response.data?.choices?.[0]?.message;
+  const content = message?.content;
+  // With thinking mode, a model can burn its entire max_tokens budget on
+  // reasoning and return content: null before ever writing the actual
+  // answer (finish_reason will typically be "length" when this happens).
+  // Fail loudly here instead of letting `null` silently propagate and crash
+  // later wherever `.length` gets called on it.
+  if (typeof content !== 'string') {
+    const finishReason = response.data?.choices?.[0]?.finish_reason;
+    throw new Error(
+      `NIM returned no content for model "${model}" (finish_reason: ${finishReason || 'unknown'}). ` +
+      `This usually means it ran out of max_tokens before finishing` +
+      `${enableThinking ? ' (likely spent the whole budget on reasoning)' : ''}.`
+    );
+  }
   // Only the final answer is returned — reasoning_content (if present) is
   // internal scratch work and is never surfaced to the user.
-  return response.data.choices[0].message.content;
+  return content;
 }
 
 // Strict in-character enforcement pass. Unlike a copyedit pass, this one is
@@ -368,24 +383,42 @@ app.post('/v1/chat/completions', async (req, res) => {
     // (the model's internal "thinking") count against max_tokens too, even
     // though only the final content is ever returned to the user. Also
     // padded for the memory_note field when one is being generated.
+    // Bumped from 1024 -> 2560 base headroom: with thinking mode on, the
+    // model can burn a surprising number of tokens reasoning before it ever
+    // writes the answer, and running out mid-thought produces null content
+    // (see callNim's error for that case). More headroom makes that failure
+    // mode meaningfully less likely.
     const polishMaxTokens =
-      Math.max(256, Math.ceil(estimatedDraftTokens * 1.3)) + 1024 + (needsMemoryNote ? 650 : 0);
-
-    const polishRaw = await callNim(POLISH_MODEL, polishMessages, polishMaxTokens, true);
+      Math.max(256, Math.ceil(estimatedDraftTokens * 1.3)) + 2560 + (needsMemoryNote ? 650 : 0);
 
     let finalText;
     let memoryNote = '';
+    let polishRaw = null;
     try {
-      const cleaned = polishRaw.trim().replace(/^```json\s*|^```\s*|```$/g, '');
-      const parsed = JSON.parse(cleaned);
-      finalText = typeof parsed.reply === 'string' ? parsed.reply : draft;
-      memoryNote = typeof parsed.memory_note === 'string' ? parsed.memory_note : '';
+      polishRaw = await callNim(POLISH_MODEL, polishMessages, polishMaxTokens, true);
     } catch (err) {
-      // If the model didn't return valid JSON, fall back to treating the
-      // whole response as the reply, and skip the memory note this turn
-      // rather than risk saving garbage.
-      console.warn('Polish JSON parse failed, using raw output as reply:', err.message);
-      finalText = polishRaw;
+      // If the polish call itself fails outright (e.g. it returned no
+      // content because it burned its whole token budget on reasoning),
+      // fall back to sending the plain draft rather than failing the
+      // request. Memory just doesn't get recorded this turn in that case.
+      console.warn('Polish call failed, falling back to draft:', err.message);
+    }
+
+    if (polishRaw === null) {
+      finalText = draft;
+    } else {
+      try {
+        const cleaned = polishRaw.trim().replace(/^```json\s*|^```\s*|```$/g, '');
+        const parsed = JSON.parse(cleaned);
+        finalText = typeof parsed.reply === 'string' ? parsed.reply : draft;
+        memoryNote = typeof parsed.memory_note === 'string' ? parsed.memory_note : '';
+      } catch (err) {
+        // If the model didn't return valid JSON, fall back to treating the
+        // whole response as the reply, and skip the memory note this turn
+        // rather than risk saving garbage.
+        console.warn('Polish JSON parse failed, using raw output as reply:', err.message);
+        finalText = polishRaw;
+      }
     }
 
     // Safety net: if the polish pass still bloats the reply well past the
