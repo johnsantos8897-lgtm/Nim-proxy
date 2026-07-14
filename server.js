@@ -12,11 +12,13 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 const NIM_BASE_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
 const DRAFT_MODEL = process.env.DRAFT_MODEL || 'z-ai/glm-5.2';
-const POLISH_MODEL = process.env.POLISH_MODEL || 'z-ai/glm-5.2';
+// Two GLM calls total per message now: DRAFT_MODEL writes the actual reply
+// (sent to the user directly, no extra review pass), SUMMARY_MODEL handles
+// memory compression in the background. This trades away the in-character
+// enforcement/review pass for real latency savings.
 const SUMMARY_MODEL = process.env.SUMMARY_MODEL || DRAFT_MODEL;
-// 'high' is noticeably slower for a marginal quality gain in most cases.
-// 'medium' is a better default for chat latency; override via env if you
-// want to trade speed for more thorough in-character review.
+// Only used for the (background, non-blocking) memory summarization calls
+// if you choose to enable thinking there — off by default for speed.
 const REASONING_EFFORT = process.env.REASONING_EFFORT || 'medium';
 
 const redis = new Redis({
@@ -130,10 +132,22 @@ function groupSizeForTier(tierIndex) {
   return tierIndex === 0 ? TIER_BASE_GROUP_SIZE : TIER_UPPER_GROUP_SIZE;
 }
 
-// Note: per-message micro-summarization is now handled inline as part of
-// the combined polish+memory call (see POLISH_INSTRUCTION below), not as a
-// separate call. Only tier-merge condensation (combining several already-
-// compressed notes into one) still runs as its own occasional call.
+const MICRO_SUMMARY_INSTRUCTION =
+  "You are compressing a single roleplay message into a compact note for " +
+  "long-term memory. Preserve EVERY concrete detail: actions taken, decisions " +
+  "made, facts revealed, objects/props introduced, physical or emotional " +
+  "states, injuries, promises, and the substance of dialogue (paraphrased, " +
+  "not verbatim). You may cut purely stylistic flourish, scene-setting " +
+  "description, and repeated wording that carries no new information — but " +
+  "do not omit any plot-relevant detail. Write concise third-person notes, " +
+  "not narrative prose.\n\n" +
+  "HARD LENGTH BUDGET: your entire output must fit within roughly 500 tokens " +
+  "(about 350-375 words), no matter how long the input is. Compress more " +
+  "aggressively rather than running out of room partway through — always " +
+  "finish within budget, prioritizing the most plot-relevant details if you " +
+  "must choose what to keep.\n\n" +
+  "Return only the compressed note, no preamble.";
+
 const MERGE_SUMMARY_INSTRUCTION =
   "You are merging several already-compressed memory notes (given in " +
   "chronological order) into one combined note for long-term memory. Remove " +
@@ -238,71 +252,10 @@ async function callNim(model, messages, max_tokens = 1024, enableThinking = fals
   return content;
 }
 
-// Strict in-character enforcement pass. Unlike a copyedit pass, this one is
-// specifically hunting for character breaks and correcting them — but it's
-// still bounded: it corrects breaks, it doesn't rewrite the scene.
-const POLISH_INSTRUCTION =
-  "You are a strict in-character consistency reviewer for a roleplay draft " +
-  "written by another model. Your job is to catch and fix any place where the " +
-  "draft broke character, then hand back a corrected version — not to rewrite " +
-  "the scene.\n\n" +
-  "Check the draft against the character's established personality, voice, " +
-  "speech patterns, knowledge, and the conversation history, and fix any of " +
-  "the following if present:\n" +
-  "1. POV violations: the draft has the USER's character speak, act, or " +
-  "decide something on its own that wasn't given to it in the conversation " +
-  "history. Correct this so that character only reacts to what it was given — " +
-  "never invents its own initiative. This is the most common and most serious " +
-  "mistake to catch.\n" +
-  "2. Tone/personality breaks: the roleplay character suddenly acting far " +
-  "outside its established personality, speech style, or knowledge with no " +
-  "narrative reason (e.g. a cold character being suddenly warm, a character " +
-  "knowing something it has no way of knowing, dropping an established accent " +
-  "or verbal tic, contradicting a previously stated fact about itself).\n" +
-  "3. Meta breaks: the draft slipping out of the fiction — narrator asides, " +
-  "AI-assistant-style disclaimers, apologizing out of character, safety " +
-  "boilerplate, or any acknowledgment that this is an AI/roleplay/story. " +
-  "Remove these entirely and replace with an in-fiction equivalent if needed.\n" +
-  "4. Continuity errors: contradicting an established fact from the " +
-  "conversation history (a prop, a name, an injury, a location, a promise " +
-  "made earlier).\n\n" +
-  "If NONE of the above are present, make no changes beyond trivial word " +
-  "choice/flow polish — do not rewrite dialogue or actions that are already " +
-  "in-character and consistent, and do not add new plot events, props, or " +
-  "decisions that the draft didn't already contain.\n\n" +
-  "Use the full conversation history below only as your source of truth for " +
-  "what's already been established — do not respond to it or continue the " +
-  "conversation yourself.\n\n" +
-  "Hard constraint: your corrected reply must be roughly the same length as " +
-  "the draft (within about 20%) — you are correcting specific breaks, not " +
-  "padding or expanding the scene.\n\n" +
-  "SEPARATE TASK — memory note: you will also be told whether a memory note " +
-  "is needed this turn, and if so, given the PREVIOUS confirmed message to " +
-  "compress. This is unrelated to the draft you're correcting above — treat " +
-  "it as a completely separate mini-task using the rules below, and do not " +
-  "let it influence your correction of the draft or vice versa.\n" +
-  "- Preserve EVERY concrete detail: actions, decisions, facts revealed, " +
-  "objects/props, physical/emotional states, injuries, promises, and the " +
-  "substance of dialogue (paraphrased, not verbatim).\n" +
-  "- You may cut purely stylistic flourish and repeated wording that carries " +
-  "no new information, but never omit a plot-relevant detail.\n" +
-  "- Write concise third-person notes, not narrative prose.\n" +
-  "- HARD LENGTH BUDGET: the memory note must fit within roughly 500 tokens " +
-  "(about 350-375 words) no matter how long the input is — compress more " +
-  "aggressively rather than running out of room partway through, and always " +
-  "finish within budget, prioritizing the most plot-relevant details if you " +
-  "must choose what to keep.\n" +
-  "- If no memory note is needed this turn, leave it as an empty string.\n\n" +
-  "OUTPUT FORMAT: respond with ONLY a single JSON object, no markdown code " +
-  "fences, no text before or after it, in exactly this shape:\n" +
-  '{"reply": "<the corrected in-character reply>", "memory_note": "<the memory note, or an empty string if none was needed>"}\n' +
-  "Escape any quotes or newlines inside the strings properly so the JSON stays valid.";
-
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
     draft_model: DRAFT_MODEL,
-    polish_model: POLISH_MODEL,
     summary_model: SUMMARY_MODEL,
     key_configured: Boolean(NIM_API_KEY),
     redis_configured: Boolean(process.env.UPSTASH_REDIS_REST_URL),
@@ -355,87 +308,21 @@ app.post('/v1/chat/completions', async (req, res) => {
     const lastAssistant = getLastAssistantEntry(messages);
     const needsMemoryNote = Boolean(lastAssistant && lastAssistant.index > notebook.lastRecordedIndex);
 
-    // Step 1: draft model stays in character using the full conversation history
-    const draft = await callNim(DRAFT_MODEL, messagesWithMemory);
+    // Step 1: draft model writes the actual reply, sent to the user as-is —
+    // no second review/correction pass. This is the only call the response
+    // has to wait on.
+    let finalText = await callNim(DRAFT_MODEL, messagesWithMemory);
 
-    // Step 2: ONE combined polish call does both jobs at once — (a) strict
-    // in-character review/correction of the draft, and (b) if needed, a
-    // compressed memory note of the previous confirmed message. This avoids
-    // a separate dedicated summary call on every single message.
-    const memoryTaskText = needsMemoryNote
-      ? `MEMORY NOTE NEEDED: yes. Previous confirmed message to compress:\n${lastAssistant.content}`
-      : `MEMORY NOTE NEEDED: no. Leave "memory_note" as an empty string.`;
-
-    const polishMessages = [
-      {
-        role: 'user',
-        content:
-          `${POLISH_INSTRUCTION}\n\n` +
-          `Full conversation history (for grounding/consistency only — do not respond to it):\n` +
-          `${JSON.stringify(messages)}\n\n` +
-          `Draft to copyedit:\n${draft}\n\n` +
-          `${memoryTaskText}`,
-      },
-    ];
-
-    const estimatedDraftTokens = Math.ceil(draft.length / 4);
-    // Extra headroom beyond the normal length guard, since reasoning tokens
-    // (the model's internal "thinking") count against max_tokens too, even
-    // though only the final content is ever returned to the user. Also
-    // padded for the memory_note field when one is being generated.
-    // Bumped from 1024 -> 2560 base headroom: with thinking mode on, the
-    // model can burn a surprising number of tokens reasoning before it ever
-    // writes the answer, and running out mid-thought produces null content
-    // (see callNim's error for that case). More headroom makes that failure
-    // mode meaningfully less likely.
-    const polishMaxTokens =
-      Math.max(256, Math.ceil(estimatedDraftTokens * 1.3)) + 2560 + (needsMemoryNote ? 650 : 0);
-
-    let finalText;
-    let memoryNote = '';
-    let polishRaw = null;
-    try {
-      polishRaw = await callNim(POLISH_MODEL, polishMessages, polishMaxTokens, true);
-    } catch (err) {
-      // If the polish call itself fails outright (e.g. it returned no
-      // content because it burned its whole token budget on reasoning),
-      // fall back to sending the plain draft rather than failing the
-      // request. Memory just doesn't get recorded this turn in that case.
-      console.warn('Polish call failed, falling back to draft:', err.message);
-    }
-
-    if (polishRaw === null) {
-      finalText = draft;
-    } else {
-      try {
-        const cleaned = polishRaw.trim().replace(/^```json\s*|^```\s*|```$/g, '');
-        const parsed = JSON.parse(cleaned);
-        finalText = typeof parsed.reply === 'string' ? parsed.reply : draft;
-        memoryNote = typeof parsed.memory_note === 'string' ? parsed.memory_note : '';
-      } catch (err) {
-        // If the model didn't return valid JSON, fall back to treating the
-        // whole response as the reply, and skip the memory note this turn
-        // rather than risk saving garbage.
-        console.warn('Polish JSON parse failed, using raw output as reply:', err.message);
-        finalText = polishRaw;
-      }
-    }
-
-    // Safety net: if the polish pass still bloats the reply well past the
-    // draft, prefer the draft over a padded rewrite.
-    if (finalText.length > draft.length * 1.6) {
-      console.warn('Polish output exceeded length guard, falling back to draft.');
-      finalText = draft;
-    }
-
-    // --- Save the memory note in the BACKGROUND, not blocking the reply ---
-    // Deliberately not awaited: pushing the note and any resulting tier
-    // cascade merges are cheap/rare respectively, but this keeps the
-    // request path free of any extra wait beyond the single combined call
-    // above.
-    if (needsMemoryNote && memoryNote) {
+    // --- Memory: fully separate call, in the BACKGROUND, not blocking the reply ---
+    // Deliberately not awaited: this involves its own model call (micro-
+    // summary + possible tier cascades) that would otherwise add real
+    // latency to every single reply, for no benefit to THIS turn's response
+    // (the raw message is already in `messages` above, so the draft model
+    // sees it regardless). It just saves to Redis whenever it finishes.
+    if (needsMemoryNote) {
       notebook.lastRecordedIndex = lastAssistant.index; // mark immediately so a concurrent request can't double-record
-      pushNoteAndCascade(notebook, memoryNote)
+      condenseTexts(MICRO_SUMMARY_INSTRUCTION, [lastAssistant.content])
+        .then(microNote => pushNoteAndCascade(notebook, microNote))
         .then(() => saveNotebook(notebookKey, notebook))
         .catch(err => console.error('Background memory recording failed:', err.message));
     }
@@ -499,6 +386,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy running on port ${PORT}`);
   console.log(`Draft model: ${DRAFT_MODEL}`);
-  console.log(`Polish model: ${POLISH_MODEL}`);
   console.log(`Summary model: ${SUMMARY_MODEL}`);
 });
