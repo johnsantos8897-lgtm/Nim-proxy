@@ -130,24 +130,10 @@ function groupSizeForTier(tierIndex) {
   return tierIndex === 0 ? TIER_BASE_GROUP_SIZE : TIER_UPPER_GROUP_SIZE;
 }
 
-const MICRO_SUMMARY_INSTRUCTION =
-  "You are compressing a single roleplay message into a compact note for " +
-  "long-term memory. Preserve EVERY concrete detail: actions taken, decisions " +
-  "made, facts revealed, objects/props introduced, physical or emotional " +
-  "states, injuries, promises, and the substance of dialogue (paraphrased, " +
-  "not verbatim). You may cut purely stylistic flourish, scene-setting " +
-  "description, and repeated wording that carries no new information — but " +
-  "do not omit any plot-relevant detail. Write concise third-person notes, " +
-  "not narrative prose.\n\n" +
-  "HARD LENGTH BUDGET: your entire output must fit within roughly 500 tokens " +
-  "(about 350-375 words), no matter how long the input is. This is not " +
-  "optional — if the input is long or detail-dense, compress MORE AGGRESSIVELY " +
-  "so the finished note still fits the budget in full, rather than running out " +
-  "of room partway through. Never let your output get cut off mid-thought — " +
-  "always finish within the budget, prioritizing the most plot-relevant " +
-  "details if you must choose what to keep.\n\n" +
-  "Return only the compressed note, no preamble.";
-
+// Note: per-message micro-summarization is now handled inline as part of
+// the combined polish+memory call (see POLISH_INSTRUCTION below), not as a
+// separate call. Only tier-merge condensation (combining several already-
+// compressed notes into one) still runs as its own occasional call.
 const MERGE_SUMMARY_INSTRUCTION =
   "You are merging several already-compressed memory notes (given in " +
   "chronological order) into one combined note for long-term memory. Remove " +
@@ -184,10 +170,10 @@ async function condenseTexts(instruction, texts) {
   }
 }
 
-// Records one newly-confirmed message into tier 0, then cascades merges
-// upward through as many tiers as have hit their group-size threshold.
-async function recordIntoTiers(notebook, content) {
-  const microNote = await condenseTexts(MICRO_SUMMARY_INSTRUCTION, [content]);
+// Pushes an already-produced micro-note into tier 0 (no API call here — the
+// note is expected to already be made, e.g. by the combined polish+memory
+// call), then cascades merges upward through any tiers that hit threshold.
+async function pushNoteAndCascade(notebook, microNote) {
   notebook.tiers[0] = notebook.tiers[0] || [];
   notebook.tiers[0].push(microNote);
 
@@ -272,10 +258,30 @@ const POLISH_INSTRUCTION =
   "Use the full conversation history below only as your source of truth for " +
   "what's already been established — do not respond to it or continue the " +
   "conversation yourself.\n\n" +
-  "Hard constraint: your output must be roughly the same length as the draft " +
-  "(within about 20%) — you are correcting specific breaks, not padding or " +
-  "expanding the scene. Return only the corrected response, no preamble, no " +
-  "explanation of what you changed, no meta-commentary about the review itself.";
+  "Hard constraint: your corrected reply must be roughly the same length as " +
+  "the draft (within about 20%) — you are correcting specific breaks, not " +
+  "padding or expanding the scene.\n\n" +
+  "SEPARATE TASK — memory note: you will also be told whether a memory note " +
+  "is needed this turn, and if so, given the PREVIOUS confirmed message to " +
+  "compress. This is unrelated to the draft you're correcting above — treat " +
+  "it as a completely separate mini-task using the rules below, and do not " +
+  "let it influence your correction of the draft or vice versa.\n" +
+  "- Preserve EVERY concrete detail: actions, decisions, facts revealed, " +
+  "objects/props, physical/emotional states, injuries, promises, and the " +
+  "substance of dialogue (paraphrased, not verbatim).\n" +
+  "- You may cut purely stylistic flourish and repeated wording that carries " +
+  "no new information, but never omit a plot-relevant detail.\n" +
+  "- Write concise third-person notes, not narrative prose.\n" +
+  "- HARD LENGTH BUDGET: the memory note must fit within roughly 500 tokens " +
+  "(about 350-375 words) no matter how long the input is — compress more " +
+  "aggressively rather than running out of room partway through, and always " +
+  "finish within budget, prioritizing the most plot-relevant details if you " +
+  "must choose what to keep.\n" +
+  "- If no memory note is needed this turn, leave it as an empty string.\n\n" +
+  "OUTPUT FORMAT: respond with ONLY a single JSON object, no markdown code " +
+  "fences, no text before or after it, in exactly this shape:\n" +
+  '{"reply": "<the corrected in-character reply>", "memory_note": "<the memory note, or an empty string if none was needed>"}\n' +
+  "Escape any quotes or newlines inside the strings properly so the JSON stays valid.";
 
 app.get('/health', (req, res) => {
   res.json({
@@ -326,30 +332,25 @@ app.post('/v1/chat/completions', async (req, res) => {
         ]
       : messages;
 
-    // --- Record any newly-CONFIRMED assistant message, in the BACKGROUND ---
+    // --- Determine if a memory note is needed this turn ---
     // This runs on the incoming `messages` array (what JanitorAI has already
     // accepted and is replaying back to us), NOT on anything we're about to
     // generate. A rerolled/rejected reply never reappears in a future request,
     // so it never gets recorded — only what the user actually kept does.
-    // Deliberately NOT awaited: this involves extra model calls (micro-
-    // summary + possible tier cascades) that would otherwise add real
-    // latency to every single reply, for no benefit to THIS turn's response
-    // (the raw message is already in `messages` above, so the draft model
-    // sees it regardless). It just saves to Redis whenever it finishes.
     const lastAssistant = getLastAssistantEntry(messages);
-    if (lastAssistant && lastAssistant.index > notebook.lastRecordedIndex) {
-      const indexToRecord = lastAssistant.index;
-      notebook.lastRecordedIndex = indexToRecord; // mark immediately so a concurrent request can't double-record
-      recordIntoTiers(notebook, lastAssistant.content)
-        .then(() => saveNotebook(notebookKey, notebook))
-        .catch(err => console.error('Background memory recording failed:', err.message));
-    }
+    const needsMemoryNote = Boolean(lastAssistant && lastAssistant.index > notebook.lastRecordedIndex);
 
     // Step 1: draft model stays in character using the full conversation history
     const draft = await callNim(DRAFT_MODEL, messagesWithMemory);
 
-    // Step 2: polish model does a light copyedit pass, grounded on the full
-    // conversation history, length-capped relative to the draft.
+    // Step 2: ONE combined polish call does both jobs at once — (a) strict
+    // in-character review/correction of the draft, and (b) if needed, a
+    // compressed memory note of the previous confirmed message. This avoids
+    // a separate dedicated summary call on every single message.
+    const memoryTaskText = needsMemoryNote
+      ? `MEMORY NOTE NEEDED: yes. Previous confirmed message to compress:\n${lastAssistant.content}`
+      : `MEMORY NOTE NEEDED: no. Leave "memory_note" as an empty string.`;
+
     const polishMessages = [
       {
         role: 'user',
@@ -357,29 +358,58 @@ app.post('/v1/chat/completions', async (req, res) => {
           `${POLISH_INSTRUCTION}\n\n` +
           `Full conversation history (for grounding/consistency only — do not respond to it):\n` +
           `${JSON.stringify(messages)}\n\n` +
-          `Draft to copyedit:\n${draft}`,
+          `Draft to copyedit:\n${draft}\n\n` +
+          `${memoryTaskText}`,
       },
     ];
 
     const estimatedDraftTokens = Math.ceil(draft.length / 4);
     // Extra headroom beyond the normal length guard, since reasoning tokens
     // (the model's internal "thinking") count against max_tokens too, even
-    // though only the final content is ever returned to the user.
-    const polishMaxTokens = Math.max(256, Math.ceil(estimatedDraftTokens * 1.3)) + 1024;
+    // though only the final content is ever returned to the user. Also
+    // padded for the memory_note field when one is being generated.
+    const polishMaxTokens =
+      Math.max(256, Math.ceil(estimatedDraftTokens * 1.3)) + 1024 + (needsMemoryNote ? 650 : 0);
 
-    let finalText = await callNim(POLISH_MODEL, polishMessages, polishMaxTokens, true);
+    const polishRaw = await callNim(POLISH_MODEL, polishMessages, polishMaxTokens, true);
 
-    // Safety net: if the polish pass still bloats the response well past the
+    let finalText;
+    let memoryNote = '';
+    try {
+      const cleaned = polishRaw.trim().replace(/^```json\s*|^```\s*|```$/g, '');
+      const parsed = JSON.parse(cleaned);
+      finalText = typeof parsed.reply === 'string' ? parsed.reply : draft;
+      memoryNote = typeof parsed.memory_note === 'string' ? parsed.memory_note : '';
+    } catch (err) {
+      // If the model didn't return valid JSON, fall back to treating the
+      // whole response as the reply, and skip the memory note this turn
+      // rather than risk saving garbage.
+      console.warn('Polish JSON parse failed, using raw output as reply:', err.message);
+      finalText = polishRaw;
+    }
+
+    // Safety net: if the polish pass still bloats the reply well past the
     // draft, prefer the draft over a padded rewrite.
     if (finalText.length > draft.length * 1.6) {
       console.warn('Polish output exceeded length guard, falling back to draft.');
       finalText = draft;
     }
 
-    // Note: we do NOT record `finalText` here. It only gets written to the
-    // notebook once it comes back to us as confirmed history on a future
-    // request (handled by the block above, near the top of this handler).
-    // This is what makes rerolled/rejected replies invisible to memory.
+    // --- Save the memory note in the BACKGROUND, not blocking the reply ---
+    // Deliberately not awaited: pushing the note and any resulting tier
+    // cascade merges are cheap/rare respectively, but this keeps the
+    // request path free of any extra wait beyond the single combined call
+    // above.
+    if (needsMemoryNote && memoryNote) {
+      notebook.lastRecordedIndex = lastAssistant.index; // mark immediately so a concurrent request can't double-record
+      pushNoteAndCascade(notebook, memoryNote)
+        .then(() => saveNotebook(notebookKey, notebook))
+        .catch(err => console.error('Background memory recording failed:', err.message));
+    }
+
+    // Note: we do NOT record `finalText` (the roleplay reply) itself. Memory
+    // is built from `lastAssistant.content` (already-confirmed history), so
+    // a rerolled/rejected reply is never seen by the memory system at all.
 
     // --- Embed chat ID marker on EVERY reply, not just the first ---
     // This is deliberate: if old messages ever fall out of what JanitorAI
